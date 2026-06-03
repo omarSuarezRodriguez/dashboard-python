@@ -25,6 +25,7 @@ class Settings:
     message_sync_enabled: bool = True
     message_sync_interval: float = 1.0
     notification_sound_enabled: bool = True
+    chat_verify_interval: float = 300.0
     log_level: str = "INFO"
 
     @property
@@ -70,6 +71,7 @@ def load_settings() -> Settings:
     notification_sound_enabled = os.getenv(
         "NOTIFICATION_SOUND_ENABLED", "true"
     ).strip().lower() in ("1", "true", "yes", "on")
+    chat_verify_str = os.getenv("CHAT_VERIFY_INTERVAL", "300").strip()
     log_level = os.getenv("LOG_LEVEL", "INFO").strip()
 
     missing = []
@@ -97,6 +99,11 @@ def load_settings() -> Settings:
     except ValueError:
         message_sync_interval = 1.0
 
+    try:
+        chat_verify_interval = float(chat_verify_str)
+    except ValueError:
+        chat_verify_interval = 300.0
+
     if not whatsapp_from.startswith("whatsapp:"):
         whatsapp_from = f"whatsapp:{whatsapp_from}" if whatsapp_from else ""
 
@@ -114,5 +121,6 @@ def load_settings() -> Settings:
         message_sync_enabled=message_sync_enabled,
         message_sync_interval=message_sync_interval,
         notification_sound_enabled=notification_sound_enabled,
+        chat_verify_interval=chat_verify_interval,
         log_level=log_level,
     )

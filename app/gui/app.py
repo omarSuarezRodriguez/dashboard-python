@@ -13,6 +13,7 @@ from app.gui import styles as S
 from app.persistence.database import Database
 from app.services.conversation_service import ConversationService
 from app.services.twilio_service import TwilioService
+from app.services.chat_health import ChatHealthMonitor
 from app.services.message_sync import TwilioMessageSync
 from app.services.webhook_server import WebhookServer
 from app.utils.config import Settings, load_settings
@@ -22,6 +23,7 @@ from app.utils.notification_sound import is_recent_incoming_message, play_incomi
 logger = get_logger("gui")
 
 POLL_INTERVAL_MS = 300
+WARM_CACHE_DELAY_MS = 800
 
 T = TypeVar("T")
 
@@ -55,9 +57,18 @@ class WhatsAppPanelApp(ctk.CTk):
             self.event_queue,
             interval_seconds=settings.message_sync_interval,
         )
+        self.chat_health = ChatHealthMonitor(
+            self.db,
+            self.conversations,
+            self.message_sync,
+            self.event_queue,
+            verify_interval_sec=settings.chat_verify_interval,
+            on_repair_done=self._on_chat_repaired_background,
+        )
 
         self._selected_id: Optional[int] = None
         self._search_term = ""
+        self._loading_conv_id: Optional[int] = None
 
         self._build_layout()
         self._refresh_sidebar()
@@ -68,6 +79,10 @@ class WhatsAppPanelApp(ctk.CTk):
             self.webhook.start()
         else:
             logger.info("Webhook local off; sync Twilio activo")
+
+        self._run_startup_chat_maintenance()
+        self.chat_health.start()
+        self.after(WARM_CACHE_DELAY_MS, self._warm_primary_chat_cache)
 
         self._poll_events()
         self._show_status_hint()
@@ -117,6 +132,65 @@ class WhatsAppPanelApp(ctk.CTk):
             self.after(0, lambda: on_done(result))
 
         threading.Thread(target=runner, daemon=True, name="BackgroundTask").start()
+
+    def _run_startup_chat_maintenance(self) -> None:
+        """Limpia y reimporta Martin + Mi numero la primera vez (sin bloquear UI)."""
+
+        def work():
+            rebuilt = self.chat_health.run_startup_maintenance_if_needed()
+            if rebuilt:
+                self.chat_health.ensure_primary_conversations()
+            return rebuilt
+
+        def on_done(rebuilt):
+            if rebuilt:
+                self.chat_view.invalidate_all_panels()
+                self.after_idle(self._refresh_sidebar)
+                self.after(WARM_CACHE_DELAY_MS, self._warm_primary_chat_cache)
+                logger.info("Chats principales reiniciados desde Twilio")
+
+        self._run_in_background(work, on_done)
+
+    def _warm_primary_chat_cache(self) -> None:
+        """Preconstruye paneles en lotes (UI) tras cargar mensajes en segundo plano."""
+
+        def work():
+            payloads = []
+            for _number, name in (
+                ("+573001111032", "Martin"),
+                ("+35699155990", "Mi numero"),
+            ):
+                conv = self.db.find_conversation_by_contact(_number)
+                if not conv:
+                    conv = self.db.get_or_create_conversation(_number, name)
+                if conv:
+                    payloads.append((conv, self.conversations.get_messages(conv.id)))
+            return payloads
+
+        def on_done(payloads):
+            if not payloads:
+                return
+
+            def warm_one(index: int = 0):
+                if index >= len(payloads):
+                    return
+                conv, messages = payloads[index]
+                self.chat_view.warm_conversation_cache(conv, messages)
+                self.after(1, lambda: warm_one(index + 1))
+
+            warm_one(0)
+
+        self._run_in_background(work, on_done)
+
+    def _on_chat_repaired_background(self, conversation_id: int) -> None:
+        self.chat_view.invalidate_conversation(conversation_id)
+
+    def _reload_conversation_view(self, conversation_id: int) -> None:
+        conv = self.conversations.get_conversation(conversation_id)
+        if not conv:
+            return
+        messages = self.conversations.get_messages(conversation_id)
+        self.chat_view.load_conversation(conv, messages)
 
     def _show_status_hint(self):
         if self.settings.message_sync_enabled:
@@ -168,6 +242,11 @@ class WhatsAppPanelApp(ctk.CTk):
             sid = payload.get("message_sid", "")
             if sid:
                 self.conversations.update_message_status(sid, payload.get("status", ""))
+        elif event_type == "chat_repaired":
+            conv_id = payload.get("conversation_id")
+            if conv_id and self.conversations.is_same_conversation(self._selected_id, conv_id):
+                self._reload_conversation_view(conv_id)
+            self.after_idle(self._refresh_sidebar)
 
     def _on_new_message(self, payload: dict):
         message_id = payload.get("message_id")
@@ -195,12 +274,25 @@ class WhatsAppPanelApp(ctk.CTk):
                 self.footer.configure(text=f"{who}: {preview}", text_color=S.ACCENT)
             return
 
-        if self._selected_id != conv_id:
-            self._selected_id = conv_id
-
         conv = self.db.get_conversation(conv_id)
-        if conv:
+        if not conv:
+            return
+
+        if self._selected_id != conv_id:
+            if self._selected_id is not None:
+                self.chat_view.invalidate_conversation(self._selected_id)
+            self._selected_id = conv_id
             self.chat_view.set_current_conversation(conv)
+            messages = self.conversations.get_messages(conv_id)
+            self.chat_view.load_conversation(conv, messages)
+            if msg.direction == "inbound":
+                self.conversations.open_conversation(conv_id)
+            self.after_idle(self._refresh_sidebar)
+            label = "Bot" if msg.source == "bot" else ("Tú" if msg.source == "agent" else "Recibido")
+            self.footer.configure(text=f"{label} · {msg.body[:50]}", text_color=S.TEXT_SECONDARY)
+            return
+
+        self.chat_view.set_current_conversation(conv)
 
         if self.chat_view.append_message(msg):
             if msg.direction == "inbound":
@@ -238,15 +330,28 @@ class WhatsAppPanelApp(ctk.CTk):
         if self._selected_id != conversation_id:
             return
 
-        conv = self.conversations.open_conversation(conversation_id)
-        if not conv:
-            return
+        self._loading_conv_id = conversation_id
 
-        self.sidebar.update_conversation(conv)
-        messages = self.conversations.get_messages(conversation_id)
-        self.chat_view.load_conversation(conv, messages)
-        self.chat_view.clear_status()
-        self.after_idle(self._show_status_hint)
+        def work():
+            conv = self.conversations.open_conversation(conversation_id)
+            if not conv:
+                return None
+            messages = self.conversations.get_messages(conversation_id)
+            return conv, messages
+
+        def on_done(result):
+            if self._selected_id != conversation_id or self._loading_conv_id != conversation_id:
+                return
+            self._loading_conv_id = None
+            if not result:
+                return
+            conv, messages = result
+            self.sidebar.update_conversation(conv)
+            self.chat_view.load_conversation(conv, messages)
+            self.chat_view.clear_status()
+            self.after_idle(self._show_status_hint)
+
+        self._run_in_background(work, on_done)
 
     def _on_edit_contact(self, conversation_id: int, focus_field: str = "both"):
         conv = self.conversations.get_conversation(conversation_id)

@@ -1,19 +1,18 @@
 """Área principal de conversación: burbujas y envío."""
 
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import customtkinter as ctk
 
 from app.gui import styles as S
-from app.gui.widgets import hide_scrollbar, style_scrollbar
+from app.gui.widgets import style_scrollbar
 from app.persistence.models import Conversation, Message
 from app.utils.datetime_fmt import format_date_separator, format_message_time, message_date_key
 
-RENDER_BATCH_SIZE = 15
-MAX_CACHED_PANELS = 10
-SCROLL_ANIM_STEPS = 10
-SCROLL_ANIM_MS = 18
-SWITCH_FADE_MS = 40
+RENDER_BATCH_SIZE = 50
+MAX_CACHED_PANELS = 6
+AUTO_FOLLOW_THRESHOLD = 0.92
+SCROLL_RETRY_MS = 50
 
 
 class DateSeparator(ctk.CTkFrame):
@@ -67,7 +66,7 @@ class MessageBubble(ctk.CTkFrame):
 
 
 class ChatView(ctk.CTkFrame):
-    """Panel derecho con layout en grid (estable en Windows/CTk)."""
+    """Panel derecho: burbujas, scroll y envío."""
 
     def __init__(self, master, on_send: Callable[[str], None]):
         super().__init__(master, fg_color=S.BG_CHAT, corner_radius=0)
@@ -77,10 +76,8 @@ class ChatView(ctk.CTkFrame):
         self._active_panel: Optional[dict] = None
         self._render_job: Optional[str] = None
         self._scroll_job: Optional[str] = None
-        self._tail_job: Optional[str] = None
         self._pending_load_id: Optional[int] = None
         self._auto_follow = True
-        self._switch_overlay = ctk.CTkFrame(self, fg_color=S.BG_CHAT, corner_radius=0)
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -124,6 +121,12 @@ class ChatView(ctk.CTkFrame):
             scrollbar_fg_color=S.BG_CHAT,
             label_fg_color=S.BG_CHAT,
         )
+        self._messages_host = ctk.CTkFrame(
+            self.messages_frame,
+            fg_color=S.BG_CHAT,
+            corner_radius=0,
+        )
+        self._messages_host.pack(fill="x", anchor="nw")
 
         self.input_frame = ctk.CTkFrame(self, fg_color=S.BG_HEADER, corner_radius=0, height=76)
         self.input_frame.grid_propagate(False)
@@ -175,6 +178,8 @@ class ChatView(ctk.CTkFrame):
         self._bind_scroll_tracking()
         self.show_empty()
 
+    # --- Entrada / layout vacío ---
+
     def _on_enter(self, event):
         if not event.state & 0x1:
             self._send_current()
@@ -193,7 +198,6 @@ class ChatView(ctk.CTkFrame):
     def show_empty(self):
         self._cancel_render_job()
         self._cancel_scroll_job()
-        self._cancel_tail_job()
         self._current_conv = None
         self._hide_active_panel()
         self._hide_chat_widgets()
@@ -212,6 +216,8 @@ class ChatView(ctk.CTkFrame):
         self.messages_frame.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
         self.input_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=0)
 
+    # --- Scroll ---
+
     def _cancel_render_job(self):
         if self._render_job is not None:
             self.after_cancel(self._render_job)
@@ -219,103 +225,97 @@ class ChatView(ctk.CTkFrame):
 
     def _cancel_scroll_job(self):
         if self._scroll_job is not None:
-            self.after_cancel(self._scroll_job)
+            try:
+                self.after_cancel(self._scroll_job)
+            except Exception:
+                pass
             self._scroll_job = None
-
-    def _cancel_tail_job(self):
-        if self._tail_job is not None:
-            self.after_cancel(self._tail_job)
-            self._tail_job = None
 
     def _bind_scroll_tracking(self):
         try:
             canvas = self.messages_frame._parent_canvas
-            canvas.bind("<MouseWheel>", lambda _e: self.after(10, self._update_auto_follow))
-            canvas.bind("<ButtonRelease-1>", lambda _e: self.after(10, self._update_auto_follow))
+            canvas.bind("<ButtonRelease-1>", self._on_user_scroll, add="+")
+            canvas.bind("<MouseWheel>", self._on_user_scroll, add="+")
+            canvas.bind("<Button-4>", self._on_user_scroll, add="+")
+            canvas.bind("<Button-5>", self._on_user_scroll, add="+")
             self.messages_frame._scrollbar.bind(
-                "<ButtonRelease-1>", lambda _e: self.after(10, self._update_auto_follow)
+                "<ButtonRelease-1>", self._on_user_scroll, add="+"
             )
         except Exception:
             pass
 
-    def _update_auto_follow(self):
+    def _on_user_scroll(self, _event=None):
+        self.after(50, self._refresh_auto_follow)
+
+    def _refresh_auto_follow(self):
         try:
             canvas = self.messages_frame._parent_canvas
-            self._auto_follow = canvas.yview()[1] >= 0.95
+            self._auto_follow = canvas.yview()[1] >= AUTO_FOLLOW_THRESHOLD
         except Exception:
             pass
 
-    def _prepare_scroll_region(self):
+    def _update_scroll_region(self) -> bool:
         try:
             canvas = self.messages_frame._parent_canvas
-            panel = self._active_panel["frame"] if self._active_panel else None
-            if panel is not None:
-                panel.update_idletasks()
-            self.messages_frame.update_idletasks()
-            canvas.update_idletasks()
-            bbox = canvas.bbox("all")
-            if bbox:
-                canvas.configure(scrollregion=bbox)
+            host = self._messages_host
+            if self._active_panel is not None:
+                self._active_panel["frame"].update_idletasks()
+            host.update_idletasks()
+            height = host.winfo_reqheight()
+            width = max(host.winfo_reqwidth(), canvas.winfo_width(), 1)
+            if height <= 0:
+                return False
+            canvas.configure(scrollregion=(0, 0, width, height))
+            return True
         except Exception:
-            pass
+            return False
 
-    def _ensure_tail_visible(self, *, force: bool = False):
-        """Mantiene la vista al final cuando llegan mensajes nuevos."""
+    def _scroll_to_bottom(self, *, force: bool = False):
+        """Baja al último mensaje. Si force=False, solo si el usuario estaba abajo."""
         if not force and not self._auto_follow:
             return
 
-        self._cancel_tail_job()
+        self._cancel_scroll_job()
 
-        def attempt(step: int = 0):
-            self._tail_job = None
-            self._prepare_scroll_region()
+        def apply():
+            self._scroll_job = None
             try:
-                canvas = self.messages_frame._parent_canvas
-                canvas.yview_moveto(1.0)
+                if self._update_scroll_region():
+                    self.messages_frame._parent_canvas.yview_moveto(1.0)
+                    if force:
+                        self._auto_follow = True
             except Exception:
                 pass
-            if step < 5:
-                self._tail_job = self.after(30, lambda: attempt(step + 1))
 
-        attempt(0)
+        apply()
+        self._scroll_job = self.after(SCROLL_RETRY_MS, apply)
 
-    def _scroll_to_bottom(self, animated: bool = True):
-        self._cancel_scroll_job()
-        self._prepare_scroll_region()
-        try:
-            canvas = self.messages_frame._parent_canvas
-            if not animated:
-                canvas.yview_moveto(1.0)
-                return
+    # --- Paneles por conversación ---
 
-            start = canvas.yview()[0]
+    @staticmethod
+    def _messages_fingerprint(messages: List[Message]) -> Tuple[Tuple[int, str], ...]:
+        return tuple((m.id, m.created_at) for m in messages)
 
-            def step(index: int = 0):
-                self._scroll_job = None
-                if index >= SCROLL_ANIM_STEPS:
-                    canvas.yview_moveto(1.0)
-                    return
-                progress = (index + 1) / SCROLL_ANIM_STEPS
-                eased = 1.0 - (1.0 - progress) ** 2
-                canvas.yview_moveto(start + (1.0 - start) * eased)
-                self._scroll_job = self.after(SCROLL_ANIM_MS, lambda: step(index + 1))
-
-            if start >= 0.92:
-                canvas.yview_moveto(1.0)
-            else:
-                step(0)
-        except Exception:
-            pass
+    @staticmethod
+    def _can_incremental_sync(panel: dict, messages: List[Message]) -> bool:
+        prev = panel.get("fingerprint")
+        if not prev or not panel.get("built"):
+            return False
+        current = ChatView._messages_fingerprint(messages)
+        if len(current) < len(prev):
+            return False
+        return current[: len(prev)] == prev
 
     def _create_panel(self, conversation_id: int) -> dict:
-        frame = ctk.CTkFrame(self.messages_frame, fg_color=S.BG_CHAT, corner_radius=0)
+        frame = ctk.CTkFrame(self._messages_host, fg_color=S.BG_CHAT, corner_radius=0)
         return {
             "conversation_id": conversation_id,
             "frame": frame,
             "displayed_ids": set(),
             "shown_dates": set(),
             "built": False,
-            "scroll_y": 1.0,
+            "fingerprint": (),
+            "empty_label": None,
         }
 
     def _get_panel(self, conversation_id: int) -> dict:
@@ -341,30 +341,22 @@ class ChatView(ctk.CTkFrame):
             self._active_panel["frame"].pack_forget()
             self._active_panel = None
 
-    def _show_panel(self, panel: dict, *, smooth: bool = False):
-        switching = (
-            smooth
-            and self._active_panel is not None
-            and self._active_panel is not panel
-            and self.messages_frame.winfo_ismapped()
-        )
-        if switching:
-            self._switch_overlay.grid(row=1, column=0, sticky="nsew")
-            self._switch_overlay.lift()
-
+    def _show_panel(self, panel: dict):
+        self._cancel_scroll_job()
         self._hide_active_panel()
-        panel["frame"].pack(fill="both", expand=True)
+        panel["frame"].pack(fill="x", anchor="nw")
         self._active_panel = panel
-        panel["scroll_y"] = 1.0
         self._auto_follow = True
+        self.after_idle(lambda: self._scroll_to_bottom(force=True))
 
-        def finish():
-            if switching and self._switch_overlay.winfo_ismapped():
-                self._switch_overlay.grid_forget()
-            self._scroll_to_bottom(animated=smooth or switching)
-
-        delay = SWITCH_FADE_MS if switching else 0
-        self.after(delay, finish)
+    def _clear_panel_widgets(self, panel: dict):
+        for child in panel["frame"].winfo_children():
+            child.destroy()
+        panel["displayed_ids"].clear()
+        panel["shown_dates"].clear()
+        panel["empty_label"] = None
+        panel["built"] = False
+        panel["fingerprint"] = ()
 
     def _render_message(self, panel: dict, message: Message):
         if message.id in panel["displayed_ids"]:
@@ -392,22 +384,39 @@ class ChatView(ctk.CTkFrame):
         placeholder.pack(pady=40, padx=S.PADDING)
         panel["empty_label"] = placeholder
 
-    def _sync_panel_messages(self, panel: dict, messages: List[Message]):
+    def _finish_panel(self, panel: dict, messages: List[Message]):
+        panel["built"] = True
+        panel["fingerprint"] = self._messages_fingerprint(messages)
+
+    def _rebuild_panel(self, panel: dict, messages: List[Message]):
+        self._clear_panel_widgets(panel)
+        if not messages:
+            self._show_no_messages_placeholder(panel)
+        else:
+            for msg in messages:
+                self._render_message(panel, msg)
+        self._finish_panel(panel, messages)
+
+    def _append_new_messages(self, panel: dict, messages: List[Message]):
         if panel.get("empty_label") is not None:
             panel["empty_label"].destroy()
             panel["empty_label"] = None
-        new_messages = [m for m in messages if m.id not in panel["displayed_ids"]]
-        for msg in new_messages:
-            self._render_message(panel, msg)
-        panel["built"] = True
+        for msg in messages:
+            if msg.id not in panel["displayed_ids"]:
+                self._render_message(panel, msg)
+        self._finish_panel(panel, messages)
 
-    def _build_panel_batch(self, panel: dict, messages: List[Message], start: int = 0):
-        if self._pending_load_id != panel["conversation_id"]:
+    def _build_panel_batch(
+        self,
+        panel: dict,
+        messages: List[Message],
+        start: int = 0,
+        *,
+        scroll_when_done: bool = True,
+        track_load: bool = True,
+    ):
+        if track_load and self._pending_load_id != panel["conversation_id"]:
             return
-
-        if start == 0 and not self._switch_overlay.winfo_ismapped():
-            self._switch_overlay.grid(row=1, column=0, sticky="nsew")
-            self._switch_overlay.lift()
 
         end = min(start + RENDER_BATCH_SIZE, len(messages))
         for msg in messages[start:end]:
@@ -415,20 +424,49 @@ class ChatView(ctk.CTkFrame):
 
         if end < len(messages):
             self._render_job = self.after(
-                1, lambda: self._build_panel_batch(panel, messages, end)
+                1,
+                lambda p=panel, m=messages, e=end, sw=scroll_when_done, tl=track_load: (
+                    self._build_panel_batch(p, m, e, scroll_when_done=sw, track_load=tl)
+                ),
             )
             return
 
         self._render_job = None
-        panel["built"] = True
-        if self._active_panel is panel:
-            if self._switch_overlay.winfo_ismapped():
-                self._switch_overlay.grid_forget()
-            self._scroll_to_bottom(animated=True)
+        self._finish_panel(panel, messages)
+        if scroll_when_done and self._active_panel is panel:
+            self._scroll_to_bottom(force=True)
             self.message_entry.focus_set()
 
+    def warm_conversation_cache(self, conversation: Conversation, messages: List[Message]):
+        """Preconstruye el panel (hilo UI) para abrir el chat al instante después."""
+        panel = self._get_panel(conversation.id)
+        self._evict_old_panels(conversation.id)
+
+        if panel["built"] and self._can_incremental_sync(panel, messages):
+            self._append_new_messages(panel, messages)
+            return
+
+        if panel["built"]:
+            self._rebuild_panel(panel, messages)
+            return
+
+        self._clear_panel_widgets(panel)
+        if not messages:
+            self._show_no_messages_placeholder(panel)
+            self._finish_panel(panel, messages)
+            return
+
+        self._build_panel_batch(
+            panel, messages, 0, scroll_when_done=False, track_load=False
+        )
+
+    def invalidate_all_panels(self):
+        for conv_id in list(self._panels):
+            self.invalidate_conversation(conv_id)
+
+    # --- API pública ---
+
     def prepare_conversation_header(self, conversation: Conversation):
-        """Actualiza el encabezado al instante al seleccionar un chat."""
         self._show_chat_widgets()
         self.contact_label.configure(text=conversation.display_name)
         self.subtitle_label.configure(text=conversation.contact_number)
@@ -443,21 +481,28 @@ class ChatView(ctk.CTkFrame):
         panel = self._get_panel(conversation.id)
         self._evict_old_panels(conversation.id)
 
-        if panel["built"]:
-            self._sync_panel_messages(panel, messages)
-            self._show_panel(panel, smooth=True)
+        if panel["built"] and self._can_incremental_sync(panel, messages):
+            self._append_new_messages(panel, messages)
+            self._show_panel(panel)
             self.message_entry.focus_set()
             return
 
+        if panel["built"]:
+            self._rebuild_panel(panel, messages)
+            self._show_panel(panel)
+            self.message_entry.focus_set()
+            return
+
+        self._clear_panel_widgets(panel)
         if not messages:
             self._show_no_messages_placeholder(panel)
-            panel["built"] = True
-            self._show_panel(panel, smooth=True)
+            self._finish_panel(panel, messages)
+            self._show_panel(panel)
             self.message_entry.focus_set()
             return
 
-        self._show_panel(panel, smooth=True)
-        self._build_panel_batch(panel, messages, 0)
+        self._show_panel(panel)
+        self._build_panel_batch(panel, messages, 0, scroll_when_done=True, track_load=True)
 
     def set_current_conversation(self, conversation: Conversation):
         self._current_conv = conversation
@@ -494,11 +539,15 @@ class ChatView(ctk.CTkFrame):
             panel["empty_label"] = None
 
         if self._active_panel is not panel:
-            self._show_panel(panel, smooth=False)
+            self._show_panel(panel)
 
         self._render_message(panel, message)
+        fp = list(panel.get("fingerprint") or ())
+        fp.append((message.id, message.created_at))
+        panel["fingerprint"] = tuple(fp)
         panel["built"] = True
-        self._ensure_tail_visible(force=True)
+
+        self._scroll_to_bottom(force=self._auto_follow)
         return True
 
     def set_status(self, text: str, is_error: bool = False):

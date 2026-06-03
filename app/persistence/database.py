@@ -310,6 +310,85 @@ class Database:
             )
             return [self._row_to_message(r) for r in cur.fetchall()]
 
+    def count_messages(self, conversation_id: int) -> int:
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    def clear_conversation_messages(self, conversation_id: int) -> int:
+        """Elimina todos los mensajes de un chat y reinicia preview/no leídos."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            removed = int(cur.fetchone()["n"])
+            cur.execute(
+                "DELETE FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            cur.execute(
+                """
+                UPDATE conversations
+                SET last_message_preview = '',
+                    unread_count = 0,
+                    last_message_at = created_at
+                WHERE id = ?
+                """,
+                (conversation_id,),
+            )
+        logger.info("Mensajes eliminados de conversación %s: %s", conversation_id, removed)
+        return removed
+
+    def verify_conversation_integrity(self, conversation_id: int) -> List[str]:
+        """Comprobaciones ligeras; retorna códigos de problema (vacío = ok)."""
+        issues: List[str] = []
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT twilio_sid, COUNT(*) AS c FROM messages
+                WHERE conversation_id = ?
+                  AND twilio_sid IS NOT NULL AND twilio_sid != ''
+                GROUP BY twilio_sid HAVING c > 1
+                """,
+                (conversation_id,),
+            )
+            if cur.fetchall():
+                issues.append("duplicate_sids")
+
+            cur.execute(
+                """
+                SELECT created_at FROM messages
+                WHERE conversation_id = ?
+                  AND (created_at IS NULL OR created_at = '')
+                LIMIT 1
+                """,
+                (conversation_id,),
+            )
+            if cur.fetchone():
+                issues.append("empty_timestamps")
+
+            cur.execute(
+                """
+                SELECT created_at FROM messages
+                WHERE conversation_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (conversation_id,),
+            )
+            prev = None
+            for row in cur.fetchall():
+                ts = row["created_at"]
+                if prev and ts < prev:
+                    issues.append("timestamp_order")
+                    break
+                prev = ts
+        return issues
+
     def mark_conversation_read(self, conversation_id: int) -> None:
         with self._cursor() as cur:
             cur.execute(

@@ -121,6 +121,59 @@ class TwilioMessageSync:
                         )
                     )
 
+    def resync_contact(self, contact_number: str, *, days: int = 7, limit: int = 200) -> int:
+        """Reimporta mensajes de Twilio para un contacto (tras limpiar el chat)."""
+        if not self.twilio.is_configured:
+            return 0
+
+        contact = contact_key(contact_number)
+        imported_count = 0
+
+        with self._lock:
+            client = self.twilio._get_client()
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+            messages = client.messages.list(limit=limit, date_sent_after=since)
+
+            for msg in reversed(list(messages)):
+                sid = msg.sid or ""
+                if not sid:
+                    continue
+
+                body = self._extract_body(msg)
+                if not body:
+                    continue
+
+                msg_from = contact_key(getattr(msg, "from_", "") or "")
+                msg_to = contact_key(getattr(msg, "to", "") or "")
+                direction = (msg.direction or "").lower()
+                status = msg.status or "unknown"
+                sent_at = twilio_datetime_to_local_str(
+                    getattr(msg, "date_sent", None) or getattr(msg, "date_created", None)
+                )
+
+                matches = False
+                if direction == "inbound" and msg_from == contact and msg_to == self._our_number:
+                    matches = True
+                elif direction.startswith("outbound") and msg_from == self._our_number and msg_to == contact:
+                    matches = True
+
+                if not matches:
+                    continue
+
+                _imported, is_new = self.conversations.import_twilio_message(
+                    message_sid=sid,
+                    from_number=getattr(msg, "from_", ""),
+                    to_number=getattr(msg, "to", ""),
+                    body=body,
+                    direction=direction,
+                    status=status,
+                    created_at=sent_at,
+                )
+                if is_new:
+                    imported_count += 1
+
+        return imported_count
+
     @staticmethod
     def _extract_body(msg) -> str:
         body = (getattr(msg, "body", None) or "").strip()

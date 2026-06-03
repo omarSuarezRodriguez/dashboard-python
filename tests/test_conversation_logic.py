@@ -21,6 +21,7 @@ def _settings():
         webhook_enabled=False,
         message_sync_enabled=True,
         message_sync_interval=3,
+        chat_verify_interval=300.0,
     )
 
 
@@ -162,6 +163,17 @@ class ConversationLogicTests(unittest.TestCase):
 
         ordered = self.db.get_messages(conv.id)
         self.assertEqual([m.body for m in ordered], ["Antiguo", "Reciente"])
+
+    def test_clear_and_verify_conversation(self):
+        conv = self.db.get_or_create_conversation("+573001112233")
+        self.db.add_message(conv.id, "Uno", "inbound", "SM-DUP", created_at="2026-06-03 10:00:00")
+        self.db.add_message(conv.id, "Dos", "outbound", "SM-DUP", created_at="2026-06-03 10:01:00")
+        issues = self.db.verify_conversation_integrity(conv.id)
+        self.assertIn("duplicate_sids", issues)
+        removed = self.db.clear_conversation_messages(conv.id)
+        self.assertEqual(removed, 2)
+        self.assertEqual(self.db.count_messages(conv.id), 0)
+        self.assertEqual(self.db.verify_conversation_integrity(conv.id), [])
 
     def test_import_repairs_existing_timestamp(self):
         conv = self.db.get_or_create_conversation("+573001112233")
