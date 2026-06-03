@@ -28,7 +28,18 @@ class Message:
     twilio_sid: Optional[str]
     status: str
     created_at: str
+    source: str = ""  # bot | agent | vacío (contacto)
 
     @property
     def is_outbound(self) -> bool:
         return self.direction == "outbound"
+
+    @property
+    def sender_label(self) -> str:
+        if self.direction == "inbound":
+            return ""
+        if self.source == "bot":
+            return "Bot"
+        if self.source == "agent":
+            return "Tú"
+        return ""

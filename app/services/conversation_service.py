@@ -1,7 +1,7 @@
 """Lógica de negocio para conversaciones y mensajes."""
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from app.persistence.database import Database
 from app.persistence.models import Conversation, Message
@@ -16,7 +16,7 @@ logger = get_logger("conversation")
 class IncomingMessageResult:
     conversation: Conversation
     message: Message
-    is_new_conversation: bool
+    is_new: bool
 
 
 class ConversationService:
@@ -39,6 +39,58 @@ class ConversationService:
         self.db.mark_conversation_read(conversation_id)
         return self.db.get_conversation(conversation_id)
 
+    def import_twilio_message(
+        self,
+        message_sid: str,
+        from_number: str,
+        to_number: str,
+        body: str,
+        direction: str,
+        status: str = "received",
+        profile_name: str = "",
+    ) -> Tuple[Optional[Message], bool]:
+        """
+        Importa un mensaje desde Twilio (sync o webhook).
+        Retorna (mensaje, True si es nuevo en la BD).
+        """
+        if message_sid and self.db.message_exists_by_sid(message_sid):
+            return self.db.get_message_by_sid(message_sid), False
+
+        text = (body or "").strip() or "(sin contenido)"
+        dir_lower = (direction or "").lower()
+
+        if dir_lower == "inbound" or dir_lower.startswith("inbound"):
+            contact = normalize_incoming_number(from_number)
+            name = (profile_name or "").strip() or None
+            conv = self.db.get_or_create_conversation(contact, name)
+            msg = self.db.add_message(
+                conversation_id=conv.id,
+                body=text,
+                direction="inbound",
+                twilio_sid=message_sid or None,
+                status=status,
+                increment_unread=True,
+                source="",
+            )
+            return msg, True
+
+        if dir_lower.startswith("outbound"):
+            contact = normalize_incoming_number(to_number)
+            conv = self.db.get_or_create_conversation(contact)
+            msg = self.db.add_message(
+                conversation_id=conv.id,
+                body=text,
+                direction="outbound",
+                twilio_sid=message_sid or None,
+                status=status,
+                increment_unread=False,
+                source="bot",
+            )
+            return msg, True
+
+        logger.warning("Dirección Twilio no reconocida: %s", direction)
+        return None, False
+
     def process_incoming_webhook(
         self,
         from_number: str,
@@ -46,41 +98,23 @@ class ConversationService:
         message_sid: str,
         profile_name: str = "",
     ) -> IncomingMessageResult:
-        """Guarda mensaje entrante y actualiza conversación."""
-        if message_sid and self.db.message_exists_by_sid(message_sid):
-            contact = normalize_incoming_number(from_number)
-            conv = self.db.get_or_create_conversation(contact, profile_name or None)
-            messages = self.db.get_messages(conv.id)
-            last = messages[-1]
-            return IncomingMessageResult(
-                conversation=conv,
-                message=last,
-                is_new_conversation=False,
-            )
-
-        contact = normalize_incoming_number(from_number)
-        name = profile_name.strip() or None
-
-        is_new = self.db.find_conversation_by_contact(contact) is None
-
-        conv = self.db.get_or_create_conversation(contact, name)
-        msg = self.db.add_message(
-            conversation_id=conv.id,
-            body=body or "(sin contenido)",
+        """Compatibilidad webhook: delega en import_twilio_message."""
+        our = self.twilio.settings.twilio_whatsapp_from
+        msg, is_new = self.import_twilio_message(
+            message_sid=message_sid,
+            from_number=from_number,
+            to_number=our,
+            body=body,
             direction="inbound",
-            twilio_sid=message_sid or None,
             status="received",
-            increment_unread=True,
+            profile_name=profile_name,
         )
-        conv = self.db.get_conversation(conv.id) or conv
-        return IncomingMessageResult(
-            conversation=conv,
-            message=msg,
-            is_new_conversation=is_new,
-        )
+        if not msg:
+            raise ValueError("No se pudo importar mensaje entrante")
+        conv = self.db.get_conversation(msg.conversation_id)
+        return IncomingMessageResult(conversation=conv, message=msg, is_new=is_new)
 
-    def send_message(self, conversation_id: int, body: str) -> tuple:
-        """Devuelve (SendResult, Message | None)."""
+    def send_message(self, conversation_id: int, body: str) -> Tuple[SendResult, Optional[Message]]:
         conv = self.db.get_conversation(conversation_id)
         if not conv:
             return SendResult(success=False, error="Conversación no encontrada."), None
@@ -96,33 +130,35 @@ class ConversationService:
                 twilio_sid=result.sid,
                 status=result.status or "queued",
                 increment_unread=False,
+                source="agent",
             )
             return result, msg
         return result, None
 
-    def is_same_conversation(self, selected_id: Optional[int], conversation_id: int) -> bool:
-        if not selected_id:
+    def is_same_conversation(
+        self, selected_id: Optional[int], conversation_id: Optional[int]
+    ) -> bool:
+        if not selected_id or not conversation_id:
             return False
         if selected_id == conversation_id:
             return True
         selected = self.db.get_conversation(selected_id)
-        incoming = self.db.get_conversation(conversation_id)
-        if not selected or not incoming:
+        other = self.db.get_conversation(conversation_id)
+        if not selected or not other:
             return False
-        return contact_key(selected.contact_number) == contact_key(incoming.contact_number)
+        return contact_key(selected.contact_number) == contact_key(other.contact_number)
 
     def start_new_conversation(
         self,
         e164_number: str,
         first_message: str,
         contact_name: Optional[str] = None,
-    ) -> tuple:
-        """Crea o reutiliza conversación y envía primer mensaje."""
+    ) -> Tuple[Optional[Conversation], SendResult]:
         conv = self.db.get_or_create_conversation(e164_number, contact_name)
-        result = self.send_message(conv.id, first_message)
-        if result.success:
+        send_result, _msg = self.send_message(conv.id, first_message)
+        if send_result.success:
             conv = self.db.get_conversation(conv.id)
-        return conv, result
+        return conv, send_result
 
     def update_message_status(self, twilio_sid: str, status: str) -> bool:
         return self.db.update_message_status(twilio_sid, status)

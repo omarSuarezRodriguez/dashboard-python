@@ -50,6 +50,7 @@ class Database:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self.dedupe_conversations()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -73,7 +74,16 @@ class Database:
     def _init_schema(self) -> None:
         with self._cursor() as cur:
             cur.executescript(_SCHEMA)
+            self._migrate_messages_source(cur)
         logger.info("Base de datos inicializada: %s", self.db_path)
+
+    @staticmethod
+    def _migrate_messages_source(cur: sqlite3.Cursor) -> None:
+        cur.execute("PRAGMA table_info(messages)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "source" not in cols:
+            cur.execute("ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''")
+            logger.info("Migración: columna messages.source añadida")
 
     def find_conversation_by_contact(self, contact_number: str) -> Optional[Conversation]:
         """Busca conversación comparando números normalizados."""
@@ -128,6 +138,7 @@ class Database:
         status: str = "received",
         update_preview: bool = True,
         increment_unread: bool = False,
+        source: str = "",
     ) -> Message:
         now = now_local_str()
         preview = (body[:80] + "…") if len(body) > 80 else body
@@ -136,10 +147,10 @@ class Database:
             cur.execute(
                 """
                 INSERT INTO messages
-                    (conversation_id, body, direction, twilio_sid, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (conversation_id, body, direction, twilio_sid, status, created_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (conversation_id, body, direction, twilio_sid, status, now),
+                (conversation_id, body, direction, twilio_sid, status, now, source or ""),
             )
             msg_id = cur.lastrowid
 
@@ -211,6 +222,42 @@ class Database:
             )
             return cur.rowcount > 0
 
+    def get_message_by_id(self, message_id: int) -> Optional[Message]:
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
+            row = cur.fetchone()
+            return self._row_to_message(row) if row else None
+
+    def dedupe_conversations(self) -> None:
+        """Fusiona conversaciones duplicadas del mismo número."""
+        convs = self.list_conversations()
+        groups: dict = {}
+        for conv in convs:
+            key = contact_key(conv.contact_number)
+            groups.setdefault(key, []).append(conv)
+
+        with self._cursor() as cur:
+            for key, group in groups.items():
+                if len(group) < 2:
+                    continue
+                group.sort(key=lambda c: c.id)
+                primary = group[0]
+                for dup in group[1:]:
+                    cur.execute(
+                        "UPDATE messages SET conversation_id = ? WHERE conversation_id = ?",
+                        (primary.id, dup.id),
+                    )
+                    cur.execute("DELETE FROM conversations WHERE id = ?", (dup.id,))
+                    logger.info("Fusionadas conversaciones %s -> %s", dup.id, primary.id)
+
+    def get_message_by_sid(self, twilio_sid: str) -> Optional[Message]:
+        if not twilio_sid:
+            return None
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM messages WHERE twilio_sid = ? LIMIT 1", (twilio_sid,))
+            row = cur.fetchone()
+            return self._row_to_message(row) if row else None
+
     def message_exists_by_sid(self, twilio_sid: str) -> bool:
         if not twilio_sid:
             return False
@@ -232,6 +279,8 @@ class Database:
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> Message:
+        keys = row.keys()
+        source = row["source"] if "source" in keys else ""
         return Message(
             id=row["id"],
             conversation_id=row["conversation_id"],
@@ -240,4 +289,5 @@ class Database:
             twilio_sid=row["twilio_sid"],
             status=row["status"] or "unknown",
             created_at=row["created_at"],
+            source=source or "",
         )

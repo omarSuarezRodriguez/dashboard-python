@@ -23,8 +23,6 @@ POLL_INTERVAL_MS = 300
 
 
 class WhatsAppPanelApp(ctk.CTk):
-    """Aplicación de escritorio: lista de chats + conversación activa."""
-
     def __init__(self, settings: Settings):
         super().__init__()
         self.settings = settings
@@ -65,15 +63,10 @@ class WhatsAppPanelApp(ctk.CTk):
         if settings.webhook_enabled:
             self.webhook.start()
         else:
-            logger.info(
-                "Webhook local desactivado (chatbot puede usar puerto %s). "
-                "Recepción vía sincronización Twilio.",
-                settings.webhook_port,
-            )
+            logger.info("Webhook local off; sync Twilio activo")
 
         self._poll_events()
         self._show_status_hint()
-
         logger.info("Aplicación iniciada")
 
     def _build_layout(self):
@@ -88,19 +81,16 @@ class WhatsAppPanelApp(ctk.CTk):
         )
         self.sidebar.pack(side="left", fill="y")
 
-        sep = ctk.CTkFrame(main, width=1, fg_color=S.BG_INPUT, corner_radius=0)
-        sep.pack(side="left", fill="y")
+        ctk.CTkFrame(main, width=1, fg_color=S.BG_INPUT, corner_radius=0).pack(
+            side="left", fill="y"
+        )
 
         self.chat_view = ChatView(main, on_send=self._on_send_message)
         self.chat_view.pack(side="left", fill="both", expand=True)
         self.chat_view.show_empty()
 
         self.footer = ctk.CTkLabel(
-            self,
-            text="",
-            font=S.FONT_TINY,
-            text_color=S.TEXT_MUTED,
-            anchor="w",
+            self, text="", font=S.FONT_TINY, text_color=S.TEXT_MUTED, anchor="w"
         )
         self.footer.pack(fill="x", padx=S.PADDING, pady=4)
 
@@ -108,20 +98,14 @@ class WhatsAppPanelApp(ctk.CTk):
         if self.settings.message_sync_enabled:
             sec = int(self.settings.message_sync_interval)
             self.footer.configure(
-                text=(
-                    f"Chat activo · sincronizando con Twilio cada {sec}s "
-                    "(el chatbot puede seguir en /bot)"
-                ),
+                text=f"Chat activo · mensajes del contacto y del bot cada {sec}s",
                 text_color=S.ACCENT,
             )
         elif self.settings.webhook_enabled:
-            self.footer.configure(
-                text=f"Webhook: {self.webhook.incoming_url}",
-                text_color=S.ACCENT,
-            )
+            self.footer.configure(text=f"Webhook: {self.webhook.incoming_url}", text_color=S.ACCENT)
         else:
             self.footer.configure(
-                text="Activa MESSAGE_SYNC_ENABLED o WEBHOOK_ENABLED en .env",
+                text="Activa MESSAGE_SYNC_ENABLED en .env",
                 text_color=S.ERROR,
             )
 
@@ -135,55 +119,66 @@ class WhatsAppPanelApp(ctk.CTk):
         self.after(POLL_INTERVAL_MS, self._poll_events)
 
     def _handle_event(self, event_type: str, payload: dict):
-        if event_type == "incoming":
-            result = self.conversations.process_incoming_webhook(
-                from_number=payload.get("from_number", ""),
-                body=payload.get("body", ""),
-                message_sid=payload.get("message_sid", ""),
-                profile_name=payload.get("profile_name", ""),
-            )
-            self._refresh_sidebar()
-
-            if self.conversations.is_same_conversation(
-                self._selected_id, result.conversation.id
-            ):
-                self._selected_id = result.conversation.id
-                self.chat_view.append_message(result.message)
-                self.conversations.open_conversation(result.conversation.id)
-                self._refresh_sidebar()
-                self.footer.configure(
-                    text=f"Recibido · {result.message.body[:40]}",
-                    text_color=S.TEXT_SECONDARY,
+        if event_type == "new_message":
+            self._on_new_message(payload)
+        elif event_type == "incoming":
+            # Webhook legacy
+            try:
+                result = self.conversations.process_incoming_webhook(
+                    from_number=payload.get("from_number", ""),
+                    body=payload.get("body", ""),
+                    message_sid=payload.get("message_sid", ""),
+                    profile_name=payload.get("profile_name", ""),
                 )
-            else:
-                preview = (result.message.body[:50] + "…") if len(result.message.body) > 50 else result.message.body
-                self.footer.configure(
-                    text=f"Nuevo mensaje de {result.conversation.display_name}: {preview}",
-                    text_color=S.ACCENT,
-                )
-        elif event_type == "sync_outbound":
-            conv_id = payload.get("conversation_id")
-            if self.conversations.is_same_conversation(self._selected_id, conv_id):
-                self._selected_id = conv_id
-                conv = self.conversations.get_conversation(conv_id)
-                if conv:
-                    msgs = self.conversations.get_messages(conv_id)
-                    self.chat_view.load_conversation(conv, msgs)
-            self._refresh_sidebar()
+                if result.is_new:
+                    self._on_new_message(
+                        {
+                            "message_id": result.message.id,
+                            "conversation_id": result.conversation.id,
+                        }
+                    )
+            except Exception:
+                logger.exception("Error procesando webhook entrante")
         elif event_type == "status":
             sid = payload.get("message_sid", "")
-            status = payload.get("status", "")
             if sid:
-                self.conversations.update_message_status(sid, status)
-                if self._selected_id:
-                    conv = self.conversations.get_conversation(self._selected_id)
-                    if conv:
-                        msgs = self.conversations.get_messages(self._selected_id)
-                        self.chat_view.load_conversation(conv, msgs)
+                self.conversations.update_message_status(sid, payload.get("status", ""))
+
+    def _on_new_message(self, payload: dict):
+        message_id = payload.get("message_id")
+        conv_id = payload.get("conversation_id")
+        if not message_id:
+            return
+
+        msg = self.db.get_message_by_id(message_id)
+        if not msg:
+            return
+
+        self._refresh_sidebar()
+
+        if not self.conversations.is_same_conversation(self._selected_id, conv_id):
+            conv = self.db.get_conversation(conv_id)
+            if conv:
+                preview = (msg.body[:45] + "…") if len(msg.body) > 45 else msg.body
+                who = "Bot" if msg.source == "bot" else conv.display_name
+                self.footer.configure(text=f"{who}: {preview}", text_color=S.ACCENT)
+            return
+
+        if self._selected_id != conv_id:
+            self._selected_id = conv_id
+
+        if self.chat_view.append_message(msg):
+            if msg.direction == "inbound":
+                self.conversations.open_conversation(conv_id)
+                self._refresh_sidebar()
+            label = "Bot" if msg.source == "bot" else ("Tú" if msg.source == "agent" else "Recibido")
+            self.footer.configure(text=f"{label} · {msg.body[:50]}", text_color=S.TEXT_SECONDARY)
 
     def _refresh_sidebar(self):
-        convs = self.conversations.list_conversations(self._search_term)
-        self.sidebar.refresh(convs, self._selected_id)
+        self.sidebar.refresh(
+            self.conversations.list_conversations(self._search_term),
+            self._selected_id,
+        )
 
     def _on_search(self, term: str):
         self._search_term = term
@@ -194,8 +189,7 @@ class WhatsAppPanelApp(ctk.CTk):
         conv = self.conversations.open_conversation(conversation_id)
         if not conv:
             return
-        messages = self.conversations.get_messages(conversation_id)
-        self.chat_view.load_conversation(conv, messages)
+        self.chat_view.load_conversation(conv, self.conversations.get_messages(conversation_id))
         self.chat_view.clear_status()
         self._refresh_sidebar()
         self._show_status_hint()
@@ -211,19 +205,13 @@ class WhatsAppPanelApp(ctk.CTk):
             self.chat_view.append_message(message)
             self.chat_view.clear_status()
             self._refresh_sidebar()
-        elif result.success:
-            conv = self.conversations.get_conversation(self._selected_id)
-            if conv:
-                msgs = self.conversations.get_messages(self._selected_id)
-                self.chat_view.load_conversation(conv, msgs)
-            self._refresh_sidebar()
         else:
             self.chat_view.set_status(result.error or "Error al enviar", is_error=True)
 
     def _open_new_chat(self):
         if not self.twilio.is_configured:
             self.chat_view.set_status(
-                "Configura las variables Twilio en .env antes de enviar mensajes.",
+                "Configura Twilio en .env antes de enviar.",
                 is_error=True,
             )
             self.chat_view.show_empty()
@@ -240,8 +228,9 @@ class WhatsAppPanelApp(ctk.CTk):
             if result.success and conv:
                 self._selected_id = conv.id
                 self._refresh_sidebar()
-                messages = self.conversations.get_messages(conv.id)
-                self.chat_view.load_conversation(conv, messages)
+                self.chat_view.load_conversation(
+                    conv, self.conversations.get_messages(conv.id)
+                )
                 self.chat_view.clear_status()
             else:
                 self.chat_view.show_empty()
