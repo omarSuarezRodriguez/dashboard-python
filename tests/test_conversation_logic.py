@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 from app.persistence.database import Database
 from app.services.conversation_service import ConversationService
 from app.utils.config import Settings
-from app.utils.phone_validator import contact_key
+from app.utils.phone_validator import contact_key, local_number_key
 
 
 def _settings():
@@ -107,6 +107,81 @@ class ConversationLogicTests(unittest.TestCase):
             )
             c2_id = cur.lastrowid
         self.assertTrue(self.svc.is_same_conversation(c1.id, c2_id))
+
+    def test_update_contact_name_and_number(self):
+        conv = self.db.get_or_create_conversation("+573001112233", "Ana")
+        ok, error, updated = self.svc.update_contact(conv.id, "María", "+573009998887")
+        self.assertTrue(ok, error)
+        self.assertEqual(updated.contact_name, "María")
+        self.assertEqual(updated.contact_number, "+573009998887")
+
+    def test_update_contact_duplicate_number_merges(self):
+        c1 = self.db.get_or_create_conversation("+573001112233", "Contacto A")
+        c2 = self.db.get_or_create_conversation("+573009998887", "Contacto B")
+        ok, error, updated = self.svc.update_contact(c1.id, "Contacto A", "+573009998887")
+        self.assertTrue(ok, error)
+        self.assertEqual(updated.contact_number, "+573009998887")
+        self.assertIsNone(self.db.get_conversation(c2.id))
+        self.assertEqual(self.db.find_conversation_by_contact("+573009998887").id, c1.id)
+
+    def test_dedupe_same_local_number_keeps_named_contact(self):
+        now = "2024-01-01 12:00:00"
+        with self.db._cursor() as cur:
+            cur.execute(
+                "INSERT INTO conversations (contact_number, contact_name, last_message_at, created_at) VALUES (?, ?, ?, ?)",
+                ("+5299155990", "Mi numero", now, now),
+            )
+            cur.execute(
+                "INSERT INTO conversations (contact_number, last_message_at, created_at) VALUES (?, ?, ?)",
+                ("+35699155990", now, now),
+            )
+        self.db.dedupe_conversations()
+        matching = self.db.list_conversations()
+        malta_locals = [
+            c for c in matching if local_number_key(c.contact_number) == "99155990"
+        ]
+        self.assertEqual(len(malta_locals), 1)
+        self.assertEqual(malta_locals[0].contact_name, "Mi numero")
+        self.assertEqual(malta_locals[0].contact_number, "+35699155990")
+
+    def test_import_uses_twilio_timestamp_and_keeps_order(self):
+        conv = self.db.get_or_create_conversation("+573001112233")
+        self.db.add_message(conv.id, "Reciente", "inbound", "SM-OLD", created_at="2026-06-03 10:00:00")
+        msg, is_new = self.svc.import_twilio_message(
+            "SM-LATE",
+            "whatsapp:+573001112233",
+            "whatsapp:+573242497352",
+            "Antiguo",
+            "inbound",
+            created_at="2026-06-03 09:00:00",
+        )
+        self.assertTrue(is_new)
+        self.assertEqual(msg.created_at, "2026-06-03 09:00:00")
+        conv = self.db.get_conversation(conv.id)
+        self.assertEqual(conv.last_message_preview, "Reciente")
+
+        ordered = self.db.get_messages(conv.id)
+        self.assertEqual([m.body for m in ordered], ["Antiguo", "Reciente"])
+
+    def test_import_repairs_existing_timestamp(self):
+        conv = self.db.get_or_create_conversation("+573001112233")
+        self.db.add_message(
+            conv.id,
+            "Hola martin",
+            "outbound",
+            "SM-REPAIR",
+            created_at="2026-06-03 08:00:00",
+        )
+        msg, is_new = self.svc.import_twilio_message(
+            "SM-REPAIR",
+            "whatsapp:+573242497352",
+            "whatsapp:+573001112233",
+            "Hola martin",
+            "outbound",
+            created_at="2026-06-03 03:15:00",
+        )
+        self.assertFalse(is_new)
+        self.assertEqual(msg.created_at, "2026-06-03 03:15:00")
 
 
 if __name__ == "__main__":

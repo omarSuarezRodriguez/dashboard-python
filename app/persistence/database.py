@@ -8,7 +8,7 @@ from typing import List, Optional
 from app.persistence.models import Conversation, Message
 from app.utils.datetime_fmt import now_local_str
 from app.utils.logger import get_logger
-from app.utils.phone_validator import contact_key
+from app.utils.phone_validator import contact_key, local_number_key, split_e164
 
 logger = get_logger("database")
 
@@ -93,6 +93,20 @@ class Database:
                 return conv
         return None
 
+    def find_conversation_by_local_number(self, contact_number: str) -> Optional[Conversation]:
+        """Busca por parte local (mismo teléfono con prefijo guardado distinto)."""
+        local = local_number_key(contact_number)
+        if len(local) < 8:
+            return None
+        matches = [
+            conv
+            for conv in self.list_conversations()
+            if local_number_key(conv.contact_number) == local
+        ]
+        if not matches:
+            return None
+        return self._pick_primary_conversation(matches, prefer_named=True)
+
     def get_or_create_conversation(
         self,
         contact_number: str,
@@ -100,7 +114,16 @@ class Database:
     ) -> Conversation:
         normalized = contact_key(contact_number)
         existing = self.find_conversation_by_contact(normalized)
+        if not existing:
+            existing = self.find_conversation_by_local_number(normalized)
         if existing:
+            if len(normalized) > len(contact_key(existing.contact_number)):
+                with self._cursor() as cur:
+                    cur.execute(
+                        "UPDATE conversations SET contact_number = ? WHERE id = ?",
+                        (normalized, existing.id),
+                    )
+                existing = self.get_conversation(existing.id) or existing
             if contact_name and not existing.contact_name:
                 self._update_contact_name(existing.id, contact_name)
                 return self.get_conversation(existing.id) or existing
@@ -129,6 +152,45 @@ class Database:
                 (name, conversation_id),
             )
 
+    def update_conversation_contact(
+        self,
+        conversation_id: int,
+        contact_name: Optional[str] = None,
+        contact_number: Optional[str] = None,
+        *,
+        update_name: bool = False,
+        update_number: bool = False,
+    ) -> Optional[str]:
+        """Actualiza nombre y/o número. Retorna mensaje de error o None si ok."""
+        conv = self.get_conversation(conversation_id)
+        if not conv:
+            return "Conversación no encontrada."
+
+        name_value = conv.contact_name
+        number_value = conv.contact_number
+
+        if update_name:
+            name_value = (contact_name or "").strip() or None
+
+        if update_number:
+            if not contact_number or not contact_number.strip():
+                return "Ingresa un número telefónico."
+            number_value = contact_key(contact_number)
+            existing = self.find_conversation_by_contact(number_value)
+            if existing and existing.id != conversation_id:
+                self.merge_conversations(conversation_id, existing.id)
+
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE conversations
+                SET contact_name = ?, contact_number = ?
+                WHERE id = ?
+                """,
+                (name_value, number_value, conversation_id),
+            )
+        return None
+
     def add_message(
         self,
         conversation_id: int,
@@ -139,8 +201,9 @@ class Database:
         update_preview: bool = True,
         increment_unread: bool = False,
         source: str = "",
+        created_at: Optional[str] = None,
     ) -> Message:
-        now = now_local_str()
+        msg_time = created_at or now_local_str()
         preview = (body[:80] + "…") if len(body) > 80 else body
 
         with self._cursor() as cur:
@@ -150,25 +213,65 @@ class Database:
                     (conversation_id, body, direction, twilio_sid, status, created_at, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (conversation_id, body, direction, twilio_sid, status, now, source or ""),
+                (conversation_id, body, direction, twilio_sid, status, msg_time, source or ""),
             )
             msg_id = cur.lastrowid
 
             if update_preview:
-                unread_sql = ", unread_count = unread_count + 1" if increment_unread else ""
                 cur.execute(
-                    f"""
-                    UPDATE conversations
-                    SET last_message_at = ?,
-                        last_message_preview = ?
-                        {unread_sql}
-                    WHERE id = ?
-                    """,
-                    (now, preview, conversation_id),
+                    "SELECT last_message_at FROM conversations WHERE id = ?",
+                    (conversation_id,),
                 )
+                row = cur.fetchone()
+                current_last = row["last_message_at"] if row else ""
+                if not current_last or msg_time >= current_last:
+                    unread_sql = ", unread_count = unread_count + 1" if increment_unread else ""
+                    cur.execute(
+                        f"""
+                        UPDATE conversations
+                        SET last_message_at = ?,
+                            last_message_preview = ?
+                            {unread_sql}
+                        WHERE id = ?
+                        """,
+                        (msg_time, preview, conversation_id),
+                    )
 
             cur.execute("SELECT * FROM messages WHERE id = ?", (msg_id,))
             return self._row_to_message(cur.fetchone())
+
+    def update_message_created_at(self, twilio_sid: str, created_at: str) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE messages SET created_at = ? WHERE twilio_sid = ?",
+                (created_at, twilio_sid),
+            )
+            return cur.rowcount > 0
+
+    def refresh_conversation_last_message(self, conversation_id: int) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT body, created_at FROM messages
+                WHERE conversation_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (conversation_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            body = row["body"] or ""
+            preview = (body[:80] + "…") if len(body) > 80 else body
+            cur.execute(
+                """
+                UPDATE conversations
+                SET last_message_at = ?, last_message_preview = ?
+                WHERE id = ?
+                """,
+                (row["created_at"], preview, conversation_id),
+            )
 
     def list_conversations(self, search: str = "") -> List[Conversation]:
         query = """
@@ -201,7 +304,7 @@ class Database:
                 """
                 SELECT * FROM messages
                 WHERE conversation_id = ?
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 """,
                 (conversation_id,),
             )
@@ -228,27 +331,79 @@ class Database:
             row = cur.fetchone()
             return self._row_to_message(row) if row else None
 
+    def merge_conversations(self, keep_id: int, remove_id: int) -> None:
+        """Mueve mensajes de remove_id a keep_id y elimina el duplicado."""
+        if keep_id == remove_id:
+            return
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE messages SET conversation_id = ? WHERE conversation_id = ?",
+                (keep_id, remove_id),
+            )
+            cur.execute(
+                """
+                UPDATE conversations
+                SET unread_count = unread_count + COALESCE(
+                    (SELECT unread_count FROM conversations WHERE id = ?), 0
+                )
+                WHERE id = ?
+                """,
+                (remove_id, keep_id),
+            )
+            cur.execute("DELETE FROM conversations WHERE id = ?", (remove_id,))
+            logger.info("Fusionadas conversaciones %s -> %s", remove_id, keep_id)
+        self.refresh_conversation_last_message(keep_id)
+
     def dedupe_conversations(self) -> None:
         """Fusiona conversaciones duplicadas del mismo número."""
         convs = self.list_conversations()
-        groups: dict = {}
+        key_groups: dict = {}
         for conv in convs:
-            key = contact_key(conv.contact_number)
-            groups.setdefault(key, []).append(conv)
+            key_groups.setdefault(contact_key(conv.contact_number), []).append(conv)
+        self._dedupe_groups(key_groups)
+        local_groups: dict = {}
+        for conv in self.list_conversations():
+            local = local_number_key(conv.contact_number)
+            if len(local) >= 8:
+                local_groups.setdefault(local, []).append(conv)
+        self._dedupe_groups(local_groups, prefer_named=True, use_best_number=True)
 
-        with self._cursor() as cur:
-            for key, group in groups.items():
-                if len(group) < 2:
-                    continue
-                group.sort(key=lambda c: c.id)
-                primary = group[0]
-                for dup in group[1:]:
+    def _dedupe_groups(
+        self,
+        groups: dict,
+        *,
+        prefer_named: bool = False,
+        use_best_number: bool = False,
+    ) -> None:
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            primary = self._pick_primary_conversation(group, prefer_named=prefer_named)
+            best_number = contact_key(
+                max((c.contact_number for c in group), key=lambda n: len(contact_key(n)))
+            )
+            for dup in group:
+                if dup.id != primary.id:
+                    self.merge_conversations(primary.id, dup.id)
+            if use_best_number and contact_key(primary.contact_number) != best_number:
+                with self._cursor() as cur:
                     cur.execute(
-                        "UPDATE messages SET conversation_id = ? WHERE conversation_id = ?",
-                        (primary.id, dup.id),
+                        "UPDATE conversations SET contact_number = ? WHERE id = ?",
+                        (best_number, primary.id),
                     )
-                    cur.execute("DELETE FROM conversations WHERE id = ?", (dup.id,))
-                    logger.info("Fusionadas conversaciones %s -> %s", dup.id, primary.id)
+            primary_conv = self.get_conversation(primary.id)
+            if primary_conv and not primary_conv.contact_name:
+                named = next((c for c in group if c.contact_name), None)
+                if named and named.contact_name:
+                    self._update_contact_name(primary.id, named.contact_name)
+
+    @staticmethod
+    def _pick_primary_conversation(group: List[Conversation], prefer_named: bool = False):
+        if prefer_named:
+            named = [c for c in group if c.contact_name]
+            if named:
+                return max(named, key=lambda c: c.last_message_at)
+        return max(group, key=lambda c: (len(contact_key(c.contact_number)), c.last_message_at))
 
     def get_message_by_sid(self, twilio_sid: str) -> Optional[Message]:
         if not twilio_sid:

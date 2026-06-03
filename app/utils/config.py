@@ -24,6 +24,7 @@ class Settings:
     webhook_enabled: bool = False
     message_sync_enabled: bool = True
     message_sync_interval: float = 1.0
+    notification_sound_enabled: bool = True
     log_level: str = "INFO"
 
     @property
@@ -66,6 +67,9 @@ def load_settings() -> Settings:
         "on",
     )
     sync_interval_str = os.getenv("MESSAGE_SYNC_INTERVAL", "1").strip()
+    notification_sound_enabled = os.getenv(
+        "NOTIFICATION_SOUND_ENABLED", "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
     log_level = os.getenv("LOG_LEVEL", "INFO").strip()
 
     missing = []
@@ -109,5 +113,6 @@ def load_settings() -> Settings:
         webhook_enabled=webhook_enabled,
         message_sync_enabled=message_sync_enabled,
         message_sync_interval=message_sync_interval,
+        notification_sound_enabled=notification_sound_enabled,
         log_level=log_level,
     )

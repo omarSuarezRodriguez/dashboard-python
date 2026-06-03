@@ -38,8 +38,9 @@ class GUILayoutTests(unittest.TestCase):
         self.root.update_idletasks()
 
         self.assertIsNotNone(chat._current_conv)
-        self.assertEqual(len(chat._displayed_ids), 2)
-        self.assertGreater(len(chat.messages_frame.winfo_children()), 0)
+        panel = chat._panels[1]
+        self.assertEqual(len(panel["displayed_ids"]), 2)
+        self.assertGreater(len(panel["frame"].winfo_children()), 0)
 
     def test_preview_single_line(self):
         self.assertEqual(

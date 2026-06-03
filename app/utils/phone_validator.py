@@ -18,6 +18,7 @@ COUNTRY_PREFIXES = [
     ("+49", "Alemania"),
     ("+33", "Francia"),
     ("+44", "Reino Unido"),
+    ("+356", "Malta"),
 ]
 
 
@@ -87,3 +88,34 @@ def normalize_incoming_number(raw: str) -> str:
 def contact_key(number: str) -> str:
     """Clave única para comparar el mismo contacto con formatos distintos."""
     return normalize_incoming_number(number)
+
+
+def split_e164(e164: str) -> tuple[str, str]:
+    """Separa un E.164 en prefijo internacional y número local."""
+    normalized = contact_key(e164)
+    for prefix, _ in sorted(COUNTRY_PREFIXES, key=lambda item: len(item[0]), reverse=True):
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            return prefix, normalized[len(prefix) :]
+    if normalized.startswith("+"):
+        for length in (3, 2, 1):
+            prefix = normalized[: 1 + length]
+            local = normalized[1 + length :]
+            if local:
+                return prefix, local
+    return "+57", normalized.lstrip("+")
+
+
+def local_number_key(number: str) -> str:
+    """Parte local del número para detectar duplicados con prefijo distinto."""
+    return split_e164(number)[1]
+
+
+def prefix_menu_options(e164: str) -> tuple[list[str], str]:
+    """Opciones del selector de prefijo; incluye el detectado si no está en la lista."""
+    prefix, _ = split_e164(e164)
+    labels = [f"{p} ({n})" for p, n in COUNTRY_PREFIXES]
+    match = next((label for label in labels if label.startswith(f"{prefix} ")), None)
+    if match:
+        return labels, match
+    custom = f"{prefix} (detectado)"
+    return [custom, *labels], custom

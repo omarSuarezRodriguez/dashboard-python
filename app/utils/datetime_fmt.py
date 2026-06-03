@@ -9,6 +9,28 @@ def now_local_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def twilio_datetime_to_local_str(value) -> str:
+    """Convierte date_sent/date_created de Twilio a hora local almacenada."""
+    if value is None:
+        return now_local_str()
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(text[:19], fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            return now_local_str()
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def parse_stored_datetime(value: str) -> Optional[datetime]:
     """Interpreta valor guardado (local o UTC legado sin zona)."""
     if not value:

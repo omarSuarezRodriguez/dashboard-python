@@ -7,6 +7,7 @@ from queue import Queue
 from app.services.conversation_service import ConversationService
 from app.services.twilio_service import TwilioService
 from app.utils.config import Settings
+from app.utils.datetime_fmt import twilio_datetime_to_local_str
 from app.utils.logger import get_logger
 from app.utils.phone_validator import contact_key
 
@@ -81,6 +82,9 @@ class TwilioMessageSync:
                 msg_to = contact_key(getattr(msg, "to", "") or "")
                 direction = (msg.direction or "").lower()
                 status = msg.status or "unknown"
+                sent_at = twilio_datetime_to_local_str(
+                    getattr(msg, "date_sent", None) or getattr(msg, "date_created", None)
+                )
 
                 imported = None
                 is_new = False
@@ -93,6 +97,7 @@ class TwilioMessageSync:
                         body=body,
                         direction="inbound",
                         status=status,
+                        created_at=sent_at,
                     )
                 elif direction.startswith("outbound") and msg_from == self._our_number:
                     imported, is_new = self.conversations.import_twilio_message(
@@ -102,6 +107,7 @@ class TwilioMessageSync:
                         body=body,
                         direction="outbound",
                         status=status,
+                        created_at=sent_at,
                     )
 
                 if is_new and imported:

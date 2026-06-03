@@ -48,13 +48,19 @@ class ConversationService:
         direction: str,
         status: str = "received",
         profile_name: str = "",
+        created_at: Optional[str] = None,
     ) -> Tuple[Optional[Message], bool]:
         """
         Importa un mensaje desde Twilio (sync o webhook).
         Retorna (mensaje, True si es nuevo en la BD).
         """
         if message_sid and self.db.message_exists_by_sid(message_sid):
-            return self.db.get_message_by_sid(message_sid), False
+            existing = self.db.get_message_by_sid(message_sid)
+            if existing and created_at and existing.created_at != created_at:
+                self.db.update_message_created_at(message_sid, created_at)
+                self.db.refresh_conversation_last_message(existing.conversation_id)
+                existing = self.db.get_message_by_sid(message_sid)
+            return existing, False
 
         text = (body or "").strip() or "(sin contenido)"
         dir_lower = (direction or "").lower()
@@ -71,6 +77,7 @@ class ConversationService:
                 status=status,
                 increment_unread=True,
                 source="",
+                created_at=created_at,
             )
             return msg, True
 
@@ -85,6 +92,7 @@ class ConversationService:
                 status=status,
                 increment_unread=False,
                 source="bot",
+                created_at=created_at,
             )
             return msg, True
 
@@ -162,3 +170,22 @@ class ConversationService:
 
     def update_message_status(self, twilio_sid: str, status: str) -> bool:
         return self.db.update_message_status(twilio_sid, status)
+
+    def update_contact(
+        self,
+        conversation_id: int,
+        contact_name: Optional[str],
+        contact_number_e164: Optional[str],
+    ) -> Tuple[bool, str, Optional[Conversation]]:
+        """Actualiza nombre y número del contacto."""
+        error = self.db.update_conversation_contact(
+            conversation_id,
+            contact_name=contact_name,
+            contact_number=contact_number_e164,
+            update_name=True,
+            update_number=True,
+        )
+        if error:
+            return False, error, None
+        conv = self.db.get_conversation(conversation_id)
+        return True, "", conv
