@@ -1,0 +1,30 @@
+Configuración Twilio — copiar en la consola
+============================================
+
+1. Mantén corriendo:
+   - python run.py
+   - ngrok http 5000
+
+2. En https://console.twilio.com/ → Messaging → WhatsApp Sandbox
+   (o tu número de producción en Senders)
+
+3. Pega en Twilio (método HTTP POST) UNA de estas URLs:
+
+   Opción A (recomendada para este panel):
+   https://snowman-shower-pellet.ngrok-free.dev/webhook/whatsapp
+
+   Opción B (si ya tenías /bot configurado para el chatbot):
+   https://snowman-shower-pellet.ngrok-free.dev/bot
+   → Solo funciona si corre python run.py (panel), NO el chatbot en el puerto 5000.
+
+   Status callback URL (opcional):
+   https://snowman-shower-pellet.ngrok-free.dev/webhook/status
+
+   IMPORTANTE: ngrok solo puede reenviar a UN programa en el puerto 5000.
+   Si el chatbot está usando el puerto 5000, deténlo antes de iniciar el panel.
+
+4. Guarda cambios.
+
+5. Prueba: envía un WhatsApp al número de Twilio desde tu teléfono.
+
+Si cambias de túnel ngrok, actualiza WEBHOOK_PUBLIC_URL en .env y estas URLs.
