@@ -23,7 +23,7 @@ class Settings:
     webhook_public_url: str = ""
     webhook_enabled: bool = False
     message_sync_enabled: bool = True
-    message_sync_interval: float = 3.0
+    message_sync_interval: float = 1.0
     log_level: str = "INFO"
 
     @property
@@ -65,7 +65,7 @@ def load_settings() -> Settings:
         "yes",
         "on",
     )
-    sync_interval_str = os.getenv("MESSAGE_SYNC_INTERVAL", "3").strip()
+    sync_interval_str = os.getenv("MESSAGE_SYNC_INTERVAL", "1").strip()
     log_level = os.getenv("LOG_LEVEL", "INFO").strip()
 
     missing = []
@@ -91,7 +91,7 @@ def load_settings() -> Settings:
     try:
         message_sync_interval = float(sync_interval_str)
     except ValueError:
-        message_sync_interval = 3.0
+        message_sync_interval = 1.0
 
     if not whatsapp_from.startswith("whatsapp:"):
         whatsapp_from = f"whatsapp:{whatsapp_from}" if whatsapp_from else ""

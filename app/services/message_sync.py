@@ -30,7 +30,8 @@ class TwilioMessageSync:
         self.twilio = twilio
         self.conversations = conversations
         self.event_queue = event_queue
-        self.interval = max(2.0, interval_seconds)
+        # Mínimo 0.5s (evita saturar la API de Twilio)
+        self.interval = max(0.5, interval_seconds)
         self._thread = None
         self._stop = threading.Event()
         self._our_number = contact_key(settings.twilio_whatsapp_from)

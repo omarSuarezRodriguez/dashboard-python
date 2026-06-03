@@ -51,12 +51,18 @@ El **panel** recibe mensajes consultando la API de Twilio cada pocos segundos (n
 ```env
 WEBHOOK_ENABLED=false
 MESSAGE_SYNC_ENABLED=true
-MESSAGE_SYNC_INTERVAL=3
+MESSAGE_SYNC_INTERVAL=1
 ```
+
+Ajusta en `.env` para más velocidad:
+```env
+MESSAGE_SYNC_INTERVAL=0.5
+```
+(Mínimo 0.5 s. Menos de eso puede saturar la API de Twilio.)
 
 1. Deja el chatbot corriendo como siempre (`/bot` en ngrok).
 2. Abre el panel: `python run.py`
-3. Envía y recibe desde el panel; los mensajes del contacto aparecen en ~3 s.
+3. Envía y recibe desde el panel; los mensajes aparecen en ~1 s (o menos con `MESSAGE_SYNC_INTERVAL=0.5`).
 
 No hace falta cerrar el bot ni cambiar la URL de Twilio.
 

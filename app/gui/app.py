@@ -70,8 +70,15 @@ class WhatsAppPanelApp(ctk.CTk):
         logger.info("Aplicación iniciada")
 
     def _build_layout(self):
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
         main = ctk.CTkFrame(self, fg_color=S.BG_DARK, corner_radius=0)
-        main.pack(fill="both", expand=True)
+        main.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_columnconfigure(0, weight=0)
+        main.grid_columnconfigure(1, weight=0)
+        main.grid_columnconfigure(2, weight=1)
 
         self.sidebar = Sidebar(
             main,
@@ -79,26 +86,27 @@ class WhatsAppPanelApp(ctk.CTk):
             on_new_chat=self._open_new_chat,
             on_search=self._on_search,
         )
-        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.grid(row=0, column=0, sticky="nsw", padx=0, pady=0)
 
-        ctk.CTkFrame(main, width=1, fg_color=S.BG_INPUT, corner_radius=0).pack(
-            side="left", fill="y"
+        ctk.CTkFrame(main, width=1, fg_color=S.BG_INPUT, corner_radius=0).grid(
+            row=0, column=1, sticky="ns", padx=0, pady=0
         )
 
         self.chat_view = ChatView(main, on_send=self._on_send_message)
-        self.chat_view.pack(side="left", fill="both", expand=True)
+        self.chat_view.grid(row=0, column=2, sticky="nsew", padx=0, pady=0)
         self.chat_view.show_empty()
 
         self.footer = ctk.CTkLabel(
             self, text="", font=S.FONT_TINY, text_color=S.TEXT_MUTED, anchor="w"
         )
-        self.footer.pack(fill="x", padx=S.PADDING, pady=4)
+        self.footer.grid(row=1, column=0, sticky="ew", padx=S.PADDING, pady=4)
 
     def _show_status_hint(self):
         if self.settings.message_sync_enabled:
-            sec = int(self.settings.message_sync_interval)
+            sec = self.settings.message_sync_interval
+            interval_txt = f"{int(sec)}s" if sec >= 1 and sec == int(sec) else f"{sec:.1f}s"
             self.footer.configure(
-                text=f"Chat activo · mensajes del contacto y del bot cada {sec}s",
+                text=f"Chat activo · sincroniza mensajes cada {interval_txt}",
                 text_color=S.ACCENT,
             )
         elif self.settings.webhook_enabled:
@@ -154,9 +162,8 @@ class WhatsAppPanelApp(ctk.CTk):
         if not msg:
             return
 
-        self._refresh_sidebar()
-
         if not self.conversations.is_same_conversation(self._selected_id, conv_id):
+            self.after_idle(self._refresh_sidebar)
             conv = self.db.get_conversation(conv_id)
             if conv:
                 preview = (msg.body[:45] + "…") if len(msg.body) > 45 else msg.body
@@ -170,9 +177,11 @@ class WhatsAppPanelApp(ctk.CTk):
         if self.chat_view.append_message(msg):
             if msg.direction == "inbound":
                 self.conversations.open_conversation(conv_id)
-                self._refresh_sidebar()
+            self.after_idle(self._refresh_sidebar)
             label = "Bot" if msg.source == "bot" else ("Tú" if msg.source == "agent" else "Recibido")
             self.footer.configure(text=f"{label} · {msg.body[:50]}", text_color=S.TEXT_SECONDARY)
+        else:
+            self.after_idle(self._refresh_sidebar)
 
     def _refresh_sidebar(self):
         self.sidebar.refresh(
@@ -185,14 +194,21 @@ class WhatsAppPanelApp(ctk.CTk):
         self._refresh_sidebar()
 
     def _on_select_conversation(self, conversation_id: int):
+        if conversation_id == self._selected_id:
+            return
+
         self._selected_id = conversation_id
+        self.sidebar.set_selection(conversation_id)
+
         conv = self.conversations.open_conversation(conversation_id)
         if not conv:
             return
-        self.chat_view.load_conversation(conv, self.conversations.get_messages(conversation_id))
+
+        self.sidebar.update_conversation(conv)
+        messages = self.conversations.get_messages(conversation_id)
+        self.chat_view.load_conversation(conv, messages)
         self.chat_view.clear_status()
-        self._refresh_sidebar()
-        self._show_status_hint()
+        self.after_idle(self._show_status_hint)
 
     def _on_send_message(self, body: str):
         if not self._selected_id:
